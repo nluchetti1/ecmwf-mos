@@ -9,13 +9,14 @@ Pipeline
            Only the needed GRIB fields are downloaded, via byte ranges from
            the .index files. Only station values are stored on disk.
   obs      Pull ASOS/METAR obs from the Iowa Environmental Mesonet (IEM).
-  train    Fit a ridge-regression MOS per station x cycle x lead x predictand.
-           Prints held-out verification: raw IFS vs MOS, MAE and bias.
+  train    Ridge MOS per station x cycle x lead for TMP/DPT/WSP and N/X;
+           pooled logistic MOS for P06/P12. Prints held-out verification.
   predict  Apply the MOS to the latest complete run. Writes a CSV and a
            MAV-style HTML bulletin. Needs only mos_models.json (no sklearn),
            so it can run from GitHub Actions.
 
-Predictands: 2 m temperature (F), 2 m dewpoint (F), 10 m wind speed (kt).
+Predictands: 2 m temperature and dewpoint (F), 10 m wind speed (kt),
+daytime max / nighttime min (N/X, F), and P06/P12 (% chance >= 0.01 in).
 
 Data licence: ECMWF open data is CC-BY-4.0. Attribute ECMWF on any product.
 
@@ -70,7 +71,7 @@ PL_PARAMS = [("t", 850), ("r", 850), ("r", 700)]
 # MAV layout: 3-hourly to 60 h, then 66 and 72 h (21 columns).
 DEFAULT_STEPS = "6-60/3,66,72"
 IEM_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-OBS_VARS = ["tmpf", "dwpf", "sknt", "gust"]
+OBS_VARS = ["tmpf", "dwpf", "sknt", "gust", "p01i"]
 
 # predictand -> raw model column, used for the raw-vs-MOS comparison
 TARGETS = {"tmpf": "t2m", "dwpf": "d2m", "sknt": "ws10"}
@@ -299,8 +300,12 @@ def fetch_iem(sid, start: dt.date, end: dt.date) -> pd.DataFrame:
     r = http_get(IEM_URL, params=params, timeout=300)
     if r is None or not r.text.strip():
         return pd.DataFrame()
-    df = pd.read_csv(io.StringIO(r.text), na_values=["M", "T"])
+    df = pd.read_csv(io.StringIO(r.text), na_values=["M"], dtype=str)
     df["valid"] = pd.to_datetime(df["valid"])
+    for c in OBS_VARS:
+        if c in df:
+            # "T" (trace) only appears in precip; keep it distinct from 0
+            df[c] = pd.to_numeric(df[c].replace("T", "0.0001"), errors="coerce")
     return df
 
 
@@ -320,7 +325,7 @@ def cmd_obs(a):
         path = obs_dir / f"{sid}.csv"
         if path.exists() and not df.empty:
             old = pd.read_csv(path, parse_dates=["valid"])
-            df = pd.concat([old, df])
+            df = pd.concat([df, old])  # new first, so re-pulled rows win
         if not df.empty:
             df = df.drop_duplicates(["station", "valid"]).sort_values("valid")
             df.to_csv(path, index=False)
@@ -390,10 +395,147 @@ def pair(model: pd.DataFrame, obs: pd.DataFrame, tol_min=30) -> pd.DataFrame:
         if o.empty:
             continue
         m = m.sort_values("valid")
+        cols = ["obs_time"] + [c for c in OBS_VARS if c in o]
         parts.append(pd.merge_asof(
-            m, o[["obs_time"] + OBS_VARS], left_on="valid", right_on="obs_time",
+            m, o[cols], left_on="valid", right_on="obs_time",
             direction="nearest", tolerance=pd.Timedelta(minutes=tol_min)))
     return pd.concat(parts, ignore_index=True) if parts else pd.DataFrame()
+
+
+# --------------------------------------------------------------------------
+# N/X (daytime max / nighttime min), MAV definitions in local standard time
+# (EST = UTC-5): max 7am-7pm = 12Z-00Z, min 7pm-8am = 00Z-13Z.
+# --------------------------------------------------------------------------
+NX_FEATURES = ["tmx", "tmn", "tmean", "d2m", "u10", "v10", "ws10", "mslp",
+               "tcc", "tp12", "t850c", "r850", "r700", "doy_s", "doy_c"]
+
+
+def nx_periods(cycle, steps):
+    """(end_step, kind) for N/X periods whose 12 h model window is covered."""
+    out = []
+    for e in steps:
+        v = (cycle + e) % 24
+        if v in (0, 12) and e - 12 >= steps[0]:
+            out.append((e, "x" if v == 0 else "n"))
+    return out
+
+
+def build_nx(model: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for (run, sid), g in model.groupby(["run", "station"]):
+        g = g.set_index("step").sort_index()
+        steps = list(g.index)
+        for e, kind in nx_periods(run.hour, steps):
+            w = g.loc[(g.index >= e - 12) & (g.index <= e)]
+            if len(w) < 3 or w["t2m"].isna().all():
+                continue
+            valid = run + dt.timedelta(hours=int(e))
+            doy = valid.timetuple().tm_yday
+            rec = {"run": run, "station": sid, "cycle": run.hour, "step": int(e),
+                   "kind": kind, "valid": valid,
+                   "tmx": w["t2m"].max(), "tmn": w["t2m"].min(), "tmean": w["t2m"].mean(),
+                   "doy_s": math.sin(2 * math.pi * doy / 365.25),
+                   "doy_c": math.cos(2 * math.pi * doy / 365.25)}
+            for f in ["d2m", "u10", "v10", "ws10", "mslp", "tcc", "t850c", "r850", "r700"]:
+                rec[f] = w[f].mean() if f in w else np.nan
+            if "tp" in g:
+                tp_e = g["tp"].get(e, np.nan)
+                tp_s = 0.0 if e - 12 == 0 else g["tp"].get(e - 12, np.nan)
+                rec["tp12"] = max(0.0, (tp_e - tp_s) * 1000.0)
+            rec["nx_raw"] = rec["tmx"] if kind == "x" else rec["tmn"]
+            rows.append(rec)
+    return pd.DataFrame(rows)
+
+
+def nx_targets(nx: pd.DataFrame, obs: pd.DataFrame, min_obs=8) -> pd.Series:
+    """Observed max (12Z-00Z) or min (00Z-13Z) for each N/X row."""
+    out = pd.Series(np.nan, index=nx.index)
+    for sid, g in nx.groupby("station"):
+        o = obs[(obs["station"] == sid) & obs["tmpf"].notna()].sort_values("obs_time")
+        if o.empty:
+            continue
+        t = o["obs_time"].to_numpy()
+        v = o["tmpf"].to_numpy()
+        for i, r in g.iterrows():
+            end = np.datetime64(r["valid"])
+            if r["kind"] == "x":
+                lo, hi = end - np.timedelta64(12, "h"), end
+            else:
+                lo, hi = end - np.timedelta64(12, "h"), end + np.timedelta64(1, "h")
+            a, b = np.searchsorted(t, lo, "left"), np.searchsorted(t, hi, "right")
+            seg = v[a:b]
+            if len(seg) >= min_obs:
+                out[i] = seg.max() if r["kind"] == "x" else seg.min()
+    return out
+
+
+# --------------------------------------------------------------------------
+# P06 / P12: probability of >= 0.01 in in the 6/12 h ending at the column
+# --------------------------------------------------------------------------
+POP_FEATURES = ["tpw", "tpw_log", "d2m", "dd", "r850", "r700", "t850c",
+                "u10", "v10", "mslp", "tcc", "doy_s", "doy_c"]
+POP_MIN_STEP = 12
+
+
+def hourly_precip(obs: pd.DataFrame) -> dict:
+    """Per-station hourly precip series, indexed by hour-ending time.
+
+    METAR precip resets at the routine ob; specials carry the running total.
+    Each station's routine minute is taken as the most common ob minute,
+    and the max p01i between routine obs is that hour's amount. Stations
+    that never report measurable precip are treated as non-reporting."""
+    out = {}
+    if "p01i" not in obs:
+        return out
+    for sid, o in obs.groupby("station"):
+        o = o.dropna(subset=["obs_time"])
+        if (o["p01i"] >= 0.01).sum() < 20:
+            continue
+        m = int(o["obs_time"].dt.minute.mode().iloc[0])
+        key = (o["obs_time"] - pd.Timedelta(minutes=m + 1)).dt.floor("h") + pd.Timedelta(hours=1)
+        amt = o.groupby(key)["p01i"].max().fillna(0.0)  # had obs, no P group = 0
+        out[sid] = amt
+    return out
+
+
+def build_pop(model: pd.DataFrame) -> pd.DataFrame:
+    if "tp" not in model:
+        return pd.DataFrame()
+    base = model.copy()
+    base["dd"] = base["t2m"] - base["d2m"] if "d2m" in base else np.nan
+    parts = []
+    for w, kind in ((6, "p06"), (12, "p12")):
+        prev = base[["run", "station", "step", "tp"]].copy()
+        prev["step"] = prev["step"] + w
+        m = base.merge(prev, on=["run", "station", "step"], how="left", suffixes=("", "_prev"))
+        m.loc[m["step"] == w, "tp_prev"] = 0.0
+        m["tpw"] = ((m["tp"] - m["tp_prev"]) * 1000.0).clip(lower=0)
+        m["tpw_log"] = np.log1p(m["tpw"])
+        vh = m["valid"].dt.hour
+        keep = (m["step"] >= POP_MIN_STEP) & (m["step"] % 6 == 0)
+        if kind == "p12":
+            keep &= vh.isin([0, 12])
+        m = m[keep & m["tpw"].notna()].copy()
+        m["kind"] = kind
+        m["win"] = w
+        parts.append(m)
+    return pd.concat(parts, ignore_index=True)
+
+
+def pop_targets(pop: pd.DataFrame, hp: dict) -> pd.Series:
+    out = pd.Series(np.nan, index=pop.index)
+    for sid, g in pop.groupby("station"):
+        s = hp.get(sid)
+        if s is None:
+            continue
+        for i, r in g.iterrows():
+            labels = [r["valid"] - pd.Timedelta(hours=h) for h in range(r["win"])]
+            vals = s.reindex(labels)
+            if (vals >= 0.01).any():
+                out[i] = 1.0
+            elif vals.notna().all():
+                out[i] = 0.0
+    return out
 
 
 # --------------------------------------------------------------------------
@@ -449,6 +591,71 @@ def cmd_train(a):
             final.fit(gg[fg], gg[tgt])
             models[(sid, int(cyc), int(step), tgt)] = (final, fg)
 
+    # ---- N/X: per station x cycle x period-end step (ridge)
+    nx = build_nx(model)
+    nxv = []
+    if not nx.empty:
+        nx["obs"] = nx_targets(nx, obs)
+        nfeats = [f for f in NX_FEATURES if f in nx.columns]
+        for (sid, cyc, step), g in nx.groupby(["station", "cycle", "step"]):
+            g0 = g.dropna(subset=["obs", "nx_raw"])
+            if g0.empty:
+                continue
+            fg = [f for f in nfeats if g0[f].notna().mean() >= a.min_coverage]
+            gg = g0.dropna(subset=fg).sort_values("run")
+            if len(gg) < a.min_samples:
+                continue
+            n_test = max(1, int(len(gg) * a.test_frac))
+            tr, te = gg.iloc[:-n_test], gg.iloc[-n_test:]
+            pipe = make_pipeline(StandardScaler(), Ridge(alpha=a.alpha))
+            pipe.fit(tr[fg], tr["obs"])
+            pred = pipe.predict(te[fg])
+            nxv.append({"station": sid, "cycle": cyc, "step": step,
+                        "target": "max" if g0["kind"].iloc[0] == "x" else "min",
+                        "n_test": len(te),
+                        "mae_raw": np.mean(np.abs(te["nx_raw"] - te["obs"])),
+                        "mae_mos": np.mean(np.abs(pred - te["obs"])),
+                        "bias_raw": np.mean(te["nx_raw"] - te["obs"]),
+                        "bias_mos": np.mean(pred - te["obs"])})
+            final = make_pipeline(StandardScaler(), Ridge(alpha=a.alpha))
+            final.fit(gg[fg], gg["obs"])
+            models[(sid, int(cyc), int(step), "nx")] = (final, fg)
+
+    # ---- P06/P12: pooled over precip-reporting stations, per cycle x step
+    from sklearn.linear_model import LogisticRegression
+    hp = hourly_precip(obs)
+    log(f"precip-reporting stations: {sorted(hp) or 'NONE (rerun obs to add p01i)'}")
+    popv = []
+    pop = build_pop(model) if hp else pd.DataFrame()
+    if not pop.empty:
+        pop["obs"] = pop_targets(pop, hp)
+        pfeats = [f for f in POP_FEATURES if f in pop.columns]
+        for (cyc, step, kind), g in pop.groupby(["cycle", "step", "kind"]):
+            g0 = g.dropna(subset=["obs"])
+            if g0.empty:
+                continue
+            fg = [f for f in pfeats if g0[f].notna().mean() >= a.min_coverage]
+            gg = g0.dropna(subset=fg).sort_values("run")
+            runs = gg["run"].drop_duplicates()
+            n_test = max(1, int(len(runs) * a.test_frac))
+            cut = runs.iloc[-n_test]
+            tr, te = gg[gg["run"] < cut], gg[gg["run"] >= cut]
+            if len(tr) < a.min_samples or tr["obs"].sum() < 30 or te.empty:
+                continue
+            pipe = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000))
+            pipe.fit(tr[fg], tr["obs"].astype(int))
+            p = pipe.predict_proba(te[fg])[:, 1]
+            clim = tr["obs"].mean()
+            bs = np.mean((p - te["obs"]) ** 2)
+            bs_c = np.mean((clim - te["obs"]) ** 2)
+            popv.append({"cycle": cyc, "step": step, "target": kind,
+                         "n_test": len(te), "obs_freq": te["obs"].mean(),
+                         "mean_fcst": p.mean(), "brier": bs, "brier_clim": bs_c,
+                         "bss": 1 - bs / bs_c if bs_c > 0 else np.nan})
+            final = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000))
+            final.fit(gg[fg], gg["obs"].astype(int))
+            models[("ALL", int(cyc), int(step), kind)] = (final, fg)
+
     if dropped:
         log(f"features dropped for low coverage (count of models): {dropped}")
     if not models:
@@ -466,6 +673,21 @@ def cmd_train(a):
     print("\nHeld-out verification (last "
           f"{int(a.test_frac * 100)}% of runs, chronological), mean over leads:")
     print(summ.to_string())
+    if nxv:
+        nv = pd.DataFrame(nxv)
+        nv.to_csv(root / "verification_nx.csv", index=False)
+        ns = (nv.groupby(["target", "station"])[["mae_raw", "mae_mos", "bias_raw", "bias_mos"]]
+                .mean().round(2))
+        ns["mae_gain_%"] = (100 * (1 - ns["mae_mos"] / ns["mae_raw"])).round(1)
+        print("\nN/X held-out (raw = max/min of the 3-hourly IFS 2 m temps):")
+        print(ns.to_string())
+    if popv:
+        pv = pd.DataFrame(popv)
+        pv.to_csv(root / "verification_pop.csv", index=False)
+        ps = pv.groupby(["target", "cycle"])[["obs_freq", "mean_fcst", "brier",
+                                               "brier_clim", "bss"]].mean().round(3)
+        print("\nP06/P12 held-out (BSS = Brier skill vs training climatology; >0 is skill):")
+        print(ps.to_string())
     log(f"saved {len(models)} models -> {root / 'mos_models.joblib'} and mos_models.json")
 
 
@@ -488,20 +710,26 @@ def export_json(models, path: Path) -> None:
     needs no scikit-learn (and no pickle-version coupling)."""
     out = {"trained": dt.datetime.utcnow().isoformat(), "models": {}}
     for (sid, cyc, step, tgt), (pipe, fg) in models.items():
-        sc, rg = pipe.steps[0][1], pipe.steps[1][1]
-        coef = rg.coef_ / sc.scale_
-        icpt = float(rg.intercept_ - np.sum(rg.coef_ * sc.mean_ / sc.scale_))
+        sc, est = pipe.steps[0][1], pipe.steps[1][1]
+        logistic = hasattr(est, "predict_proba")
+        w = np.ravel(est.coef_)
+        b = float(np.ravel(est.intercept_)[0]) if logistic else float(est.intercept_)
+        coef = w / sc.scale_
+        icpt = float(b - np.sum(w * sc.mean_ / sc.scale_))
         out["models"][f"{sid}|{cyc}|{step}|{tgt}"] = {
-            "features": fg, "coef": [float(c) for c in coef], "intercept": icpt}
+            "features": fg, "coef": [float(c) for c in coef], "intercept": icpt,
+            "link": "logistic" if logistic else "identity"}
     path.write_text(json.dumps(out))
 
 
 class LinearMOS:
     def __init__(self, d):
         self.fg, self.coef, self.icpt = d["features"], np.array(d["coef"]), d["intercept"]
+        self.link = d.get("link", "identity")
 
     def predict(self, X):
-        return self.icpt + X[self.fg].to_numpy(float) @ self.coef
+        z = self.icpt + X[self.fg].to_numpy(float) @ self.coef
+        return 1.0 / (1.0 + np.exp(-z)) if self.link == "logistic" else z
 
 
 def load_models(path: Path) -> dict:
@@ -567,6 +795,32 @@ def cmd_predict(a):
         rec["tcc_raw"] = float(r["tcc"]) if "tcc" in r and pd.notna(r["tcc"]) else np.nan
         rows.append(rec)
     out = pd.DataFrame(rows)
+
+    def apply(frame, key_fn, col, scale=1.0):
+        vals = {}
+        for _, r in frame.iterrows():
+            entry = models.get(key_fn(r))
+            if entry is None:
+                continue
+            m, fg = entry
+            X = pd.DataFrame([[float(r.get(f, np.nan)) for f in fg]], columns=fg)
+            if not X.isna().any(axis=None):
+                vals[(r["station"], int(r["step"]))] = float(m.predict(X)[0]) * scale
+        out[col] = [vals.get((s, st), np.nan) for s, st in zip(out["station"], out["step"])]
+
+    nx = build_nx(df)
+    if not nx.empty:
+        apply(nx, lambda r: (r["station"], int(r["cycle"]), int(r["step"]), "nx"), "nx_mos")
+    else:
+        out["nx_mos"] = np.nan
+    pop = build_pop(df)
+    for kind in ("p06", "p12"):
+        sub = pop[pop["kind"] == kind] if not pop.empty else pop
+        if sub is not None and not sub.empty:
+            apply(sub, lambda r, k=kind: ("ALL", int(r["cycle"]), int(r["step"]), k),
+                  f"{kind}_mos", 100.0)
+        else:
+            out[f"{kind}_mos"] = np.nan
     out = out[out["station"].isin(stations)]
     out["sknt_mos"] = out["sknt_mos"].clip(lower=0)
     out["dwpf_mos"] = np.minimum(out["dwpf_mos"], out["tmpf_mos"])
@@ -648,19 +902,26 @@ def mos_bulletin(sid, run, g) -> str:
     head = (f" K{sid:<3}   ECMWF MOS GUIDANCE  {run.month:>2}/{run.day:02d}/{run.year}"
             f"  {run.hour:02d}00 UTC")
     lines = [head, dt_line,
-             row("HR", [f"{t.hour:02d}" for t in valid]),
-             row("TMP", [num(v) for v in g["tmpf_mos"]]),
+             row("HR", [f"{t.hour:02d}" for t in valid])]
+    if "nx_mos" in g and g["nx_mos"].notna().any():
+        lines.append(row("N/X", [num(v) for v in g["nx_mos"]]))
+    lines += [row("TMP", [num(v) for v in g["tmpf_mos"]]),
              row("DPT", [num(v) for v in g["dwpf_mos"]])]
     if g["tcc_raw"].notna().any():
         lines.append(row("CLD", [_cld(v) for v in g["tcc_raw"]]))
     if any(wdr):
         lines.append(row("WDR", wdr))
     lines.append(row("WSP", wsp))
+    for kind, label in (("p06", "P06"), ("p12", "P12")):
+        col = f"{kind}_mos"
+        if col in g and g[col].notna().any():
+            lines.append(row(label, [num(v) for v in g[col]]))
     return "\n".join(lines)
 
 
 def bulletin_html(text: str, run) -> str:
-    notes = ("TMP/DPT/WSP: ECMWF IFS MOS (ridge regression vs ASOS).  "
+    notes = ("N/X, TMP, DPT, WSP: ECMWF IFS MOS (ridge regression vs METAR).  "
+             "P06/P12: logistic MOS, % chance of >=0.01 in.\n"
              "CLD/WDR: raw IFS, not statistically corrected.\n"
              "Source: ECMWF open data, CC-BY-4.0.")
     return f"""<!DOCTYPE html>
@@ -719,7 +980,12 @@ def cmd_probe(a):
     end = dt.date.today() + dt.timedelta(days=1)
     for sid in STATIONS:
         try:
-            df = fetch_iem(sid, end - dt.timedelta(days=2), end)
+            df = fetch_iem(sid, end - dt.timedelta(days=60), end)
+            if not df.empty and "p01i" in df:
+                wet = int((df["p01i"] >= 0.01).sum())
+                print(f"  {sid}: precip, last 60 days: {df['p01i'].notna().sum()} obs with "
+                      f"a value, {wet} with >= 0.01 in"
+                      + ("   <- looks NON-reporting" if wet == 0 else ""))
             if df.empty:
                 print(f"  {sid}: no data")
                 ok = False
