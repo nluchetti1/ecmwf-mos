@@ -4,8 +4,8 @@ on:
   schedule:
     # Several tries per cycle; predict exits quietly if the newest complete
     # run is already published, so extra triggers cost ~1 min each.
-    - cron: "20 8,9,10 * * *"     # 00Z run
-    - cron: "20 20,21,22 * * *"   # 12Z run (only used if 12Z models exist)
+    - cron: "20 5,6,7 * * *"     # 00Z run
+    - cron: "20 19,20,22 * * *"   # 12Z run (only used if 12Z models exist)
   workflow_dispatch:
 
 permissions:
