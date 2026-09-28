@@ -16,7 +16,8 @@ Pipeline
            so it can run from GitHub Actions.
 
 Predictands: 2 m temperature and dewpoint (F), 10 m wind speed (kt),
-daytime max / nighttime min (N/X, F), and P06/P12 (% chance >= 0.01 in).
+daytime max / nighttime min (N/X, F), P06/P12 (% chance >= 0.01 in), and
+T06/T12 (% chance of thunder: TS/VCTS reported in the METAR, ~10 NM).
 
 Data licence: ECMWF open data is CC-BY-4.0. Attribute ECMWF on any product.
 
@@ -65,13 +66,14 @@ STATIONS = {
     "MLB": (28.1028, -80.6453),   # Melbourne Intl
 }
 
-SFC_PARAMS = ["2t", "2d", "10u", "10v", "msl", "tcc", "tp", "10fg"]
-PL_PARAMS = [("t", 850), ("r", 850), ("r", 700)]
+SFC_PARAMS = ["2t", "2d", "10u", "10v", "msl", "tcc", "tp", "10fg", "mucape"]
+PL_PARAMS = [("t", 850), ("r", 850), ("r", 700), ("t", 500)]
 
 # MAV layout: 3-hourly to 60 h, then 66 and 72 h (21 columns).
 DEFAULT_STEPS = "6-60/3,66,72"
 IEM_URL = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
-OBS_VARS = ["tmpf", "dwpf", "sknt", "gust", "p01i"]
+OBS_VARS = ["tmpf", "dwpf", "sknt", "gust", "p01i", "wxcodes"]
+OBS_TEXT = {"wxcodes"}  # kept as text (present weather, e.g. "-TSRA BR", "VCTS")
 
 # predictand -> raw model column, used for the raw-vs-MOS comparison
 TARGETS = {"tmpf": "t2m", "dwpf": "d2m", "sknt": "ws10"}
@@ -206,28 +208,68 @@ def parse_steps(spec: str) -> list[int]:
     return sorted(set(steps))
 
 
-def fetch_run(base, run, steps, model_dir: Path, workers=8, force=False) -> Path | None:
+def fetch_run(base, run, steps, model_dir: Path, workers=8, force=False,
+              only=None) -> Path | None:
+    """Fetch one run to <model_dir>/<YYYYMMDDHH>.csv.
+
+    only: list of variable names (e.g. ["mucape", "t500"]) to ADD to an
+    existing run file without re-downloading anything else. Variables the
+    archive doesn't have for that run are recorded as NaN rows so reruns
+    skip them."""
     out = model_dir / f"{run:%Y%m%d%H}.csv"
     miss = model_dir / f"{run:%Y%m%d%H}.missing"
-    if out.exists() and not force:
-        return out
-    if miss.exists() and not force:
-        return None
+    rstr = run.strftime("%Y-%m-%d %H:%M")
+    need = None
+    if only:
+        if not out.exists():
+            only = None  # no file yet: do a normal full fetch
+        else:
+            have = set(pd.read_csv(out, usecols=["var"])["var"].unique())
+            need = [v for v in only if v not in have]
+            if not need:
+                return out
+    if not only:
+        if out.exists() and not force:
+            return out
+        if miss.exists() and not force:
+            return None
+
+    with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+        idxs = list(ex.map(lambda st: fetch_index(base, run, st), steps))
 
     tasks, seen_missing = [], set()
-    for step in steps:
-        idx = fetch_index(base, run, step)
+    wanted = need or SFC_PARAMS + [f"{p}{lev}" for p, lev in PL_PARAMS]
+    for step, idx in zip(steps, idxs):
         if idx is None:
             log(f"  {run:%Y%m%d%H} +{step}h: no index")
             continue
         found = {}
         for e in idx:
             name = field_name(e)
-            if name and name not in found:
+            if name and name in wanted and name not in found:
                 found[name] = e
-        wanted = SFC_PARAMS + [f"{p}{lev}" for p, lev in PL_PARAMS]
         seen_missing |= {w for w in wanted if w not in found}
         tasks += [(step, name, e) for name, e in found.items()]
+
+    if need is not None:
+        def work_add(t):
+            step, name, e = t
+            vals = point_values(get_field_bytes(base, run, step, e))
+            return [(rstr, step, sid, name, v) for sid, v in vals.items()]
+        rows = []
+        with cf.ThreadPoolExecutor(max_workers=workers) as ex:
+            for res in ex.map(work_add, tasks):
+                rows += res
+        got = {r[3] for r in rows}
+        for v in need:  # absent from the archive for this run: mark as checked
+            if v not in got:
+                rows += [(rstr, steps[0], sid, v, np.nan) for sid in STATIONS]
+        old = pd.read_csv(out)
+        df = pd.concat([old, pd.DataFrame(rows, columns=old.columns)], ignore_index=True)
+        tmp = out.with_suffix(".tmp")
+        df.to_csv(tmp, index=False)
+        tmp.replace(out)
+        return out
 
     if not tasks:
         # Only mark as permanently missing once the run is old enough that
@@ -277,7 +319,7 @@ def cmd_fetch(a):
     t0 = time.time()
     for k, run in enumerate(runs, 1):
         try:
-            p = fetch_run(base, run, steps, model_dir, a.workers, a.force)
+            p = fetch_run(base, run, steps, model_dir, a.workers, a.force, a.only)
             status = "ok" if p else "missing"
         except Exception as e:  # keep going; rerun later fills the gap
             status = f"ERROR {e}"
@@ -303,7 +345,7 @@ def fetch_iem(sid, start: dt.date, end: dt.date) -> pd.DataFrame:
     df = pd.read_csv(io.StringIO(r.text), na_values=["M"], dtype=str)
     df["valid"] = pd.to_datetime(df["valid"])
     for c in OBS_VARS:
-        if c in df:
+        if c in df and c not in OBS_TEXT:
             # "T" (trace) only appears in precip; keep it distinct from 0
             df[c] = pd.to_numeric(df[c].replace("T", "0.0001"), errors="coerce")
     return df
@@ -361,6 +403,12 @@ def derive(df: pd.DataFrame) -> pd.DataFrame:
     if "10fg" in df: df["gust10"] = df["10fg"] * KT_PER_MS
     if "msl" in df:  df["mslp"] = df["msl"] / 100.0
     if "t850" in df: df["t850c"] = df["t850"] - 273.15
+    if "t500" in df:
+        df["t500c"] = df["t500"] - 273.15
+        if "t850c" in df:
+            df["lr85"] = df["t850c"] - df["t500c"]  # 850-500 hPa lapse, C
+    if "mucape" in df:
+        df["cape_log"] = np.log1p(df["mucape"].clip(lower=0))
     if "tp" in df:
         # tp is accumulated from t=0; convert to accumulation since the
         # previous fetched step (first step: since t=0), in mm.
@@ -474,6 +522,11 @@ def nx_targets(nx: pd.DataFrame, obs: pd.DataFrame, min_obs=8) -> pd.Series:
 # --------------------------------------------------------------------------
 POP_FEATURES = ["tpw", "tpw_log", "d2m", "dd", "r850", "r700", "t850c",
                 "u10", "v10", "mslp", "tcc", "doy_s", "doy_c"]
+TS_FEATURES = ["tpw", "tpw_log", "cape_log", "cape_max_log", "lr85", "t500c",
+               "d2m", "dd", "r850", "r700", "t850c", "u10", "v10", "doy_s", "doy_c"]
+# (kind, window h, family). Thunder = any TS/VCTS in the METAR present
+# weather during the window (ASOS lightning detection ~10 NM, or observer).
+PROB_KINDS = [("p06", 6, "pop"), ("p12", 12, "pop"), ("t06", 6, "ts"), ("t12", 12, "ts")]
 POP_MIN_STEP = 12
 
 
@@ -503,8 +556,20 @@ def build_pop(model: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     base = model.copy()
     base["dd"] = base["t2m"] - base["d2m"] if "d2m" in base else np.nan
+    if "cape_log" in base:
+        cm = {}
+        for w in (6, 12):
+            lags = []
+            for lag in range(0, w, 3):
+                sh = base[["run", "station", "step", "cape_log"]].copy()
+                sh["step"] = sh["step"] + lag
+                lags.append(base[["run", "station", "step"]].merge(
+                    sh, on=["run", "station", "step"], how="left")["cape_log"].to_numpy())
+            cm[w] = np.nanmax(np.vstack(lags), axis=0) if lags else np.nan
     parts = []
-    for w, kind in ((6, "p06"), (12, "p12")):
+    for kind, w, fam in PROB_KINDS:
+        if "cape_log" in base:
+            base["cape_max_log"] = cm[w]
         prev = base[["run", "station", "step", "tp"]].copy()
         prev["step"] = prev["step"] + w
         m = base.merge(prev, on=["run", "station", "step"], how="left", suffixes=("", "_prev"))
@@ -513,13 +578,44 @@ def build_pop(model: pd.DataFrame) -> pd.DataFrame:
         m["tpw_log"] = np.log1p(m["tpw"])
         vh = m["valid"].dt.hour
         keep = (m["step"] >= POP_MIN_STEP) & (m["step"] % 6 == 0)
-        if kind == "p12":
+        if w == 12:
             keep &= vh.isin([0, 12])
         m = m[keep & m["tpw"].notna()].copy()
         m["kind"] = kind
+        m["fam"] = fam
         m["win"] = w
         parts.append(m)
     return pd.concat(parts, ignore_index=True)
+
+
+def thunder_obs(obs: pd.DataFrame) -> dict:
+    """Per-station (times, is_thunder) arrays; stations that never report
+    TS in the record are treated as non-reporting."""
+    out = {}
+    if "wxcodes" not in obs:
+        return out
+    for sid, o in obs.groupby("station"):
+        o = o.dropna(subset=["obs_time"]).sort_values("obs_time")
+        ts = o["wxcodes"].fillna("").astype(str).str.contains("TS").to_numpy()
+        if ts.sum() < 20:
+            continue
+        out[sid] = (o["obs_time"].to_numpy(), ts)
+    return out
+
+
+def ts_targets(pop: pd.DataFrame, tso: dict, min_obs=4) -> pd.Series:
+    out = pd.Series(np.nan, index=pop.index)
+    for sid, g in pop.groupby("station"):
+        if sid not in tso:
+            continue
+        t, ts = tso[sid]
+        for i, r in g.iterrows():
+            hi = np.datetime64(r["valid"])
+            lo = hi - np.timedelta64(int(r["win"]), "h")
+            a_, b_ = np.searchsorted(t, lo, "right"), np.searchsorted(t, hi, "right")
+            if b_ - a_ >= min_obs:
+                out[i] = float(ts[a_:b_].any())
+    return out
 
 
 def pop_targets(pop: pd.DataFrame, hp: dict) -> pd.Series:
@@ -548,6 +644,26 @@ def cmd_train(a):
     from sklearn.preprocessing import StandardScaler
 
     root = Path(a.data_dir)
+    # Evaluation mode: hold out a date block (e.g. one cool season) instead
+    # of the last test_frac of runs. Models trained this way are NOT saved.
+    evalmode = bool(a.test_start)
+    if evalmode:
+        ts = pd.Timestamp(a.test_start)
+        te_end = pd.Timestamp(a.test_end) + pd.Timedelta(hours=23)
+        tag = a.tag or f"{ts:%Y%m%d}_{te_end:%Y%m%d}"
+        log(f"EVALUATION MODE: testing on runs {ts:%Y-%m-%d} to {te_end:%Y-%m-%d}, "
+            f"training on all other runs. Production models are not touched.")
+
+    def split(gg):
+        """Return (train, test) for one group, sorted by run."""
+        gg = gg.sort_values("run")
+        if evalmode:
+            m = (gg["run"] >= ts) & (gg["run"] <= te_end)
+            return gg[~m], gg[m]
+        runs = gg["run"].drop_duplicates()
+        cut = runs.iloc[-max(1, int(len(runs) * a.test_frac))]
+        return gg[gg["run"] < cut], gg[gg["run"] >= cut]
+
     model = load_model(root / "model")
     obs = load_obs(root / "obs")
     if model.empty or obs.empty:
@@ -571,8 +687,9 @@ def cmd_train(a):
             gg = g0.dropna(subset=fg).sort_values("run")
             if len(gg) < a.min_samples:
                 continue
-            n_test = max(1, int(len(gg) * a.test_frac))
-            tr, te = gg.iloc[:-n_test], gg.iloc[-n_test:]
+            tr, te = split(gg)
+            if len(tr) < a.min_samples or len(te) < 20:
+                continue
             pipe = make_pipeline(StandardScaler(), Ridge(alpha=a.alpha))
             pipe.fit(tr[fg], tr[tgt])
             pred = pipe.predict(te[fg])
@@ -605,8 +722,9 @@ def cmd_train(a):
             gg = g0.dropna(subset=fg).sort_values("run")
             if len(gg) < a.min_samples:
                 continue
-            n_test = max(1, int(len(gg) * a.test_frac))
-            tr, te = gg.iloc[:-n_test], gg.iloc[-n_test:]
+            tr, te = split(gg)
+            if len(tr) < a.min_samples or len(te) < 20:
+                continue
             pipe = make_pipeline(StandardScaler(), Ridge(alpha=a.alpha))
             pipe.fit(tr[fg], tr["obs"])
             pred = pipe.predict(te[fg])
@@ -624,23 +742,31 @@ def cmd_train(a):
     # ---- P06/P12: pooled over precip-reporting stations, per cycle x step
     from sklearn.linear_model import LogisticRegression
     hp = hourly_precip(obs)
+    tso = thunder_obs(obs)
     log(f"precip-reporting stations: {sorted(hp) or 'NONE (rerun obs to add p01i)'}")
+    log(f"thunder-reporting stations: {sorted(tso) or 'NONE (rerun obs to add wxcodes)'}")
     popv = []
-    pop = build_pop(model) if hp else pd.DataFrame()
+    pop = build_pop(model) if (hp or tso) else pd.DataFrame()
     if not pop.empty:
-        pop["obs"] = pop_targets(pop, hp)
-        pfeats = [f for f in POP_FEATURES if f in pop.columns]
+        pop["obs"] = np.nan
+        isp = pop["fam"] == "pop"
+        if hp:
+            pop.loc[isp, "obs"] = pop_targets(pop[isp], hp)
+        if tso:
+            pop.loc[~isp, "obs"] = ts_targets(pop[~isp], tso)
+        if "cape_log" not in pop:
+            log("no mucape in model files: thunder uses precip/moisture predictors only "
+                "(run fetch --only mucape t500)")
         for (cyc, step, kind), g in pop.groupby(["cycle", "step", "kind"]):
             g0 = g.dropna(subset=["obs"])
             if g0.empty:
                 continue
+            flist = TS_FEATURES if g0["fam"].iloc[0] == "ts" else POP_FEATURES
+            pfeats = [f for f in flist if f in g0.columns]
             fg = [f for f in pfeats if g0[f].notna().mean() >= a.min_coverage]
             gg = g0.dropna(subset=fg).sort_values("run")
-            runs = gg["run"].drop_duplicates()
-            n_test = max(1, int(len(runs) * a.test_frac))
-            cut = runs.iloc[-n_test]
-            tr, te = gg[gg["run"] < cut], gg[gg["run"] >= cut]
-            if len(tr) < a.min_samples or tr["obs"].sum() < 30 or te.empty:
+            tr, te = split(gg)
+            if len(tr) < a.min_samples or tr["obs"].sum() < 20 or te.empty:
                 continue
             pipe = make_pipeline(StandardScaler(), LogisticRegression(C=1.0, max_iter=2000))
             pipe.fit(tr[fg], tr["obs"].astype(int))
@@ -660,22 +786,25 @@ def cmd_train(a):
         log(f"features dropped for low coverage (count of models): {dropped}")
     if not models:
         sys.exit("No groups met --min-samples. Fetch more history or lower it.")
-    joblib.dump({"models": models,
-                 "trained": dt.datetime.utcnow().isoformat()},
-                root / "mos_models.joblib")
-    export_json(models, root / "mos_models.json")
+    sfx = f"_{tag}" if evalmode else ""
+    if not evalmode:
+        joblib.dump({"models": models,
+                     "trained": dt.datetime.utcnow().isoformat()},
+                    root / "mos_models.joblib")
+        export_json(models, root / "mos_models.json")
     v = pd.DataFrame(verif)
-    v.to_csv(root / "verification.csv", index=False)
+    v.to_csv(root / f"verification{sfx}.csv", index=False)
 
     summ = (v.groupby(["target", "station"])[["mae_raw", "mae_mos", "bias_raw", "bias_mos"]]
              .mean().round(2))
     summ["mae_gain_%"] = (100 * (1 - summ["mae_mos"] / summ["mae_raw"])).round(1)
-    print("\nHeld-out verification (last "
-          f"{int(a.test_frac * 100)}% of runs, chronological), mean over leads:")
+    period = (f"runs {ts:%Y-%m-%d} to {te_end:%Y-%m-%d}" if evalmode
+              else f"last {int(a.test_frac * 100)}% of runs, chronological")
+    print(f"\nHeld-out verification ({period}), mean over leads:")
     print(summ.to_string())
     if nxv:
         nv = pd.DataFrame(nxv)
-        nv.to_csv(root / "verification_nx.csv", index=False)
+        nv.to_csv(root / f"verification_nx{sfx}.csv", index=False)
         ns = (nv.groupby(["target", "station"])[["mae_raw", "mae_mos", "bias_raw", "bias_mos"]]
                 .mean().round(2))
         ns["mae_gain_%"] = (100 * (1 - ns["mae_mos"] / ns["mae_raw"])).round(1)
@@ -683,12 +812,17 @@ def cmd_train(a):
         print(ns.to_string())
     if popv:
         pv = pd.DataFrame(popv)
-        pv.to_csv(root / "verification_pop.csv", index=False)
+        pv.to_csv(root / f"verification_pop{sfx}.csv", index=False)
         ps = pv.groupby(["target", "cycle"])[["obs_freq", "mean_fcst", "brier",
                                                "brier_clim", "bss"]].mean().round(3)
-        print("\nP06/P12 held-out (BSS = Brier skill vs training climatology; >0 is skill):")
+        print("\nP06/P12 rain and T06/T12 thunder held-out "
+              "(BSS = Brier skill vs training climatology; >0 is skill):")
         print(ps.to_string())
-    log(f"saved {len(models)} models -> {root / 'mos_models.joblib'} and mos_models.json")
+    if evalmode:
+        log(f"evaluation only: {len(models)} models fitted, NOT saved; "
+            f"scores in verification*{sfx}.csv")
+    else:
+        log(f"saved {len(models)} models -> {root / 'mos_models.joblib'} and mos_models.json")
 
 
 # --------------------------------------------------------------------------
@@ -814,7 +948,7 @@ def cmd_predict(a):
     else:
         out["nx_mos"] = np.nan
     pop = build_pop(df)
-    for kind in ("p06", "p12"):
+    for kind, _, _ in PROB_KINDS:
         sub = pop[pop["kind"] == kind] if not pop.empty else pop
         if sub is not None and not sub.empty:
             apply(sub, lambda r, k=kind: ("ALL", int(r["cycle"]), int(r["step"]), k),
@@ -912,7 +1046,7 @@ def mos_bulletin(sid, run, g) -> str:
     if any(wdr):
         lines.append(row("WDR", wdr))
     lines.append(row("WSP", wsp))
-    for kind, label in (("p06", "P06"), ("p12", "P12")):
+    for kind, label in (("p06", "P06"), ("p12", "P12"), ("t06", "T06"), ("t12", "T12")):
         col = f"{kind}_mos"
         if col in g and g[col].notna().any():
             lines.append(row(label, [num(v) for v in g[col]]))
@@ -921,7 +1055,8 @@ def mos_bulletin(sid, run, g) -> str:
 
 def bulletin_html(text: str, run) -> str:
     notes = ("N/X, TMP, DPT, WSP: ECMWF IFS MOS (ridge regression vs METAR).  "
-             "P06/P12: logistic MOS, % chance of >=0.01 in.\n"
+             "P06/P12: logistic MOS, % chance of >=0.01 in.  "
+             "T06/T12: % chance of thunder (TS/VCTS in METAR, ~10 NM).\n"
              "CLD/WDR: raw IFS, not statistically corrected.\n"
              "Source: ECMWF open data, CC-BY-4.0.")
     return f"""<!DOCTYPE html>
@@ -986,6 +1121,10 @@ def cmd_probe(a):
                 print(f"  {sid}: precip, last 60 days: {df['p01i'].notna().sum()} obs with "
                       f"a value, {wet} with >= 0.01 in"
                       + ("   <- looks NON-reporting" if wet == 0 else ""))
+            if not df.empty and "wxcodes" in df:
+                nts = int(df["wxcodes"].fillna("").astype(str).str.contains("TS").sum())
+                print(f"  {sid}: thunder (TS/VCTS) obs, last 60 days: {nts}"
+                      + ("   <- looks NON-reporting" if nts == 0 else ""))
             if df.empty:
                 print(f"  {sid}: no data")
                 ok = False
@@ -1053,6 +1192,8 @@ def main():
     f.add_argument("--steps", default=DEFAULT_STEPS)
     f.add_argument("--workers", type=int, default=8)
     f.add_argument("--force", action="store_true")
+    f.add_argument("--only", nargs="+", help="add just these variables to existing run "
+                   "files, e.g. --only mucape t500")
 
     o = sub.add_parser("obs")
     o.add_argument("--start", required=True)
@@ -1062,6 +1203,10 @@ def main():
     t.add_argument("--alpha", type=float, default=1.0)
     t.add_argument("--min-samples", type=int, default=150)
     t.add_argument("--test-frac", type=float, default=0.2)
+    t.add_argument("--test-start", help="YYYY-MM-DD: evaluate on a date block instead "
+                   "(models are not saved)")
+    t.add_argument("--test-end", help="YYYY-MM-DD, used with --test-start")
+    t.add_argument("--tag", help="suffix for evaluation output files, e.g. cool2526")
     t.add_argument("--min-coverage", type=float, default=0.9,
                    help="keep a feature only if present in this fraction of rows")
 
