@@ -36,7 +36,7 @@ jobs:
         run: >
           python ecmwf_mos.py --source google --data-dir work predict
           --models models/mos_models.json
-          --stations XMR TTS MLB
+          --stations XMR TTS MLB COF
           --html docs/index.html
 
       - name: Commit bulletin
